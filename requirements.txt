@@ -1,0 +1,11 @@
+streamlit
+pypdf
+python-pptx
+faiss-cpu
+numpy
+sentence-transformers
+tiktoken
+openai>=1.30.0
+google-genai
+reportlab
+groq
