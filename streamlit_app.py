@@ -1,101 +1,125 @@
+# streamlit_app.py
 import os
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List
 
 import streamlit as st
 
-from rag_core import ingest_file, load_store, is_on_topic, retrieve, support_strength
+from rag_core import ingest_file, load_store, retrieve
 from llm_providers import generate_doc_answer, generate_topical_answer, provider_names
 
 st.set_page_config(page_title="Chat with RAG", page_icon="💬", layout="wide")
 st.title("💬 Chat with RAG (PDF/PPT)")
 
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Settings")
     provider = st.selectbox("LLM Provider", provider_names(), index=0)
-    st.caption("Set API keys in Settings → Secrets on Streamlit Cloud")
-
-    st.subheader("Relevance & Support Gates")
-    on_topic_thresh = st.slider("On-topic threshold", 0.0, 1.0, 0.25, 0.01)
-    support_thresh = st.slider("Doc support threshold", 0.0, 1.0, 0.35, 0.01)
+    st.caption("Set keys in Streamlit Cloud → Settings → Secrets")
 
     st.markdown("---")
-    st.subheader("🎯 Try these questions")
-    st.caption("Use after uploading a sample doc")
-    example_qs = [
-        "What is the scope of this document?",
-        "List key findings with page references",
-        "What assumptions were made?",
-        "Summarize the limitations",
-        "Give an executive summary in 5 bullets",
-        "What are future work items?",
-    ]
-    for q in example_qs:
-        st.code(q, language="text")
+    st.subheader("🧹 Utilities")
+    if st.button("Clear chat history"):
+        st.session_state.messages = []
+        st.success("Chat cleared.")
+    if st.button("Forget indexed document"):
+        st.session_state.doc_id = None
+        st.success("Document cleared.")
 
+# ---------- Session state ----------
 if "doc_id" not in st.session_state:
     st.session_state.doc_id = None
+if "messages" not in st.session_state:
+    st.session_state.messages: List[Dict] = []
 
-uploaded = st.file_uploader("Upload a PDF or PPT/PPTX", type=["pdf", "ppt", "pptx"], accept_multiple_files=False)
+# ---------- Upload & indexing ----------
+uploaded = st.file_uploader(
+    "Upload a PDF or PPT/PPTX",
+    type=["pdf", "ppt", "pptx"],
+    accept_multiple_files=False,
+    help="After indexing, you can chat below."
+)
 
-col1, col2 = st.columns([1, 2])
-with col1:
+col_left, col_right = st.columns([1, 2])
+
+with col_left:
     if uploaded is not None and st.button("Index document", use_container_width=True):
         tmp_path = Path("/tmp") / uploaded.name
         tmp_path.write_bytes(uploaded.read())
         try:
             doc_id = ingest_file(str(tmp_path))
             st.session_state.doc_id = doc_id
-            st.success(f"Document indexed ✅  (doc_id: {doc_id[:8]}…)")
+            st.success(f"Indexed ✅  (doc_id: {doc_id[:8]}…)")
         except Exception as e:
             st.error(f"Failed to index: {e}")
 
-with col2:
+with col_right:
     if st.session_state.doc_id:
-        st.info("Ask on-topic questions for doc-grounded answers with citations. If the model needs related info beyond the document, it will label it as **Off-doc (related)**. Irrelevant questions return an error.")
+        st.info("Ask anything. The app first answers from the document (with citations). "
+                "If the info isn’t in the file, it will answer as **Off-doc (related)**.")
 
-q = st.text_input("Ask a question…", placeholder="e.g., What are the key risks identified?")
-ask = st.button("Ask", type="primary")
+# ---------- Show chat history ----------
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg.get("citations"):
+            with st.expander("Sources", expanded=False):
+                st.markdown(", ".join(sorted(set(msg["citations"]))))
 
-if ask:
+# ---------- Chat input ----------
+question = st.chat_input("Ask a question about the uploaded document…")
+
+if question:
+    # show the user message immediately
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    # guard: require a document
     if not st.session_state.doc_id:
-        st.error("Please upload and index a document first.")
-    elif not q.strip():
-        st.error("Please enter a question.")
+        assistant_text = "Please upload and index a document first."
+        st.session_state.messages.append({"role": "assistant", "content": assistant_text})
+        with st.chat_message("assistant"):
+            st.markdown(assistant_text)
     else:
         try:
+            # 1) Retrieve top chunks (no thresholds—always attempt doc-grounded first)
             doc = load_store("store", st.session_state.doc_id)
-            on_topic, topic_sim = is_on_topic(q, doc.centroid, on_topic_thresh)
-            st.write(f"**Topic similarity:** {topic_sim:.3f}")
+            hits = retrieve(doc, question, k=6)
 
-            if not on_topic:
-                st.error("irrelevant")
+            # 2) Try to answer ONLY from the document excerpts
+            ans_doc = generate_doc_answer(hits, question, provider)
+
+            # Our doc-only prompt says: "I couldn't find an answer in the document."
+            # If that appears, fall back to a general knowledge answer.
+            if "couldn't find an answer in the document" in ans_doc.lower():
+                ans = generate_topical_answer(question, provider)
+                mode = "off-doc"
+                citations = []
             else:
-                hits = retrieve(doc, q, k=6)
-                support = support_strength(hits)
-                st.write(f"**Doc support:** {support:.3f}")
+                ans = ans_doc
+                mode = "doc"
+                citations = [h["ref"] for h in hits]
 
-                if support >= support_thresh:
-                    ans = generate_doc_answer(hits, q, provider)
-                    st.markdown(ans)
+            # 3) Show + store assistant message
+            st.session_state.messages.append(
+                {"role": "assistant", "content": ans, "citations": citations, "mode": mode}
+            )
+            with st.chat_message("assistant"):
+                st.markdown(ans)
+                if citations:
+                    with st.expander("Sources", expanded=False):
+                        st.markdown(", ".join(sorted(set(citations))))
 
-                    with st.expander("Sources (retrieved chunks)"):
-                        for h in hits:
-                            st.markdown(f"**{h['ref']}** — score={h['score']:.3f}")
-                            st.write(h["text"])
-                            st.markdown("---")
-                else:
-                    ans = generate_topical_answer(q, provider)
-                    st.markdown(ans)
         except Exception as e:
-            st.exception(e)
+            err = f"⚠️ Error while answering: {e}"
+            st.session_state.messages.append({"role": "assistant", "content": err})
+            with st.chat_message("assistant"):
+                st.error(err)
 
+# ---------- Footer note ----------
 st.markdown("---")
-st.subheader("ℹ️ Notes")
-st.markdown(
-    """
-- Answers may include citations like `[ref: page_3, page_4]` or `[ref: slide_2]`.
-- Thresholds can be tuned from the sidebar.
-- This demo stores indices in the ephemeral `/store` folder on Streamlit Cloud.
-    """
+st.caption(
+    "Tip: Ask follow-ups naturally. The history stays visible above like a chatbot. "
+    "Answers use document citations when available; otherwise you'll see an Off-doc (related) answer."
 )
